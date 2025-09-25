@@ -197,6 +197,10 @@ class PandasModel(QAbstractTableModel):
     def dataframe(self) -> pd.DataFrame:
         return self._df
 
+    def full_dataframe(self) -> pd.DataFrame:
+        """Kembalikan seluruh data (semua halaman)."""
+        return self._full_df
+
 # ------------------------------ Matplotlib UI ------------------------------
 
 class MplCanvas(FigureCanvas):
@@ -942,7 +946,7 @@ class MainWindow(QMainWindow):
 
         # Urutkan NA I K berdasarkan TOTAL (naik) agar barh enak dibaca dari bawah -> atas
         data["__total__"] = data.sum(axis=1)
-        data = data.sort_values(by="__total__", ascending=True).drop(columns="__total__")
+        data = data.sort_values(by="__total__", ascending=False).drop(columns="__total__")
         return data
 
     def _install_table_context(self, view: QTableView):
@@ -1873,15 +1877,38 @@ class MainWindow(QMainWindow):
 
     def export_filtered(self):
         try:
-            model = self.filtered_table.model()
-            if not isinstance(model, PandasModel):
-                QMessageBox.information(self, APP_NAME, "No filtered data to export.")
+            # Prioritas: seluruh hasil filter jika ada
+            df_to_save = None
+
+            view_model = self.filtered_table.model() if hasattr(self, "filtered_table") else None
+            if isinstance(view_model, PandasModel):
+                # ambil all pages dari model
+                try:
+                    df_to_save = view_model.full_dataframe().copy()
+                except Exception:
+                    pass
+
+            # fallback: variabel penampung hasil filter
+            if df_to_save is None and getattr(self, "filtered_df", None) is not None:
+                df_to_save = self.filtered_df.copy()
+
+            # fallback terakhir: seluruh dataset
+            if df_to_save is None and self.df is not None:
+                df_to_save = self.df.copy()
+
+            if df_to_save is None or df_to_save.empty:
+                QMessageBox.information(self, APP_NAME, "Tidak ada data untuk diekspor.")
                 return
-            df = model.dataframe()
-            path, _ = QFileDialog.getSaveFileName(self, "Save Filtered CSV", str(Path.home()/"filtered.csv"), "CSV (*.csv)")
+
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Filtered CSV",
+                str(Path.home() / "filtered.csv"),
+                "CSV (*.csv)"
+            )
             if not path:
                 return
-            df.to_csv(path, index=False)
+
+            df_to_save.to_csv(path, index=False)
             QMessageBox.information(self, APP_NAME, f"Saved: {path}")
         except Exception as e:
             self._show_error(e)
@@ -2204,6 +2231,22 @@ class MainWindow(QMainWindow):
             # jalankan apply_filter dengan cfg ini
             self.apply_filter_from_cfg(self.filter_cfg)
 
+    def _reset_canvas(self, top_pad=0.86):
+        """Reset figure/axes dengan layout stabil untuk Matplotlib+Qt."""
+        fig = self.canvas.figure
+        # bersihkan semua artists/legend/colorbar
+        fig.clf()
+        # Matplotlib 3.7+: pastikan constrained_layout nonaktif jika sebelumnya pernah aktif
+        try:
+            fig.set_constrained_layout(False)
+        except Exception:
+            pass
+        ax = fig.add_subplot(111)
+        self.canvas.ax = ax
+        # sisakan ruang untuk judul/legend di atas
+        fig.subplots_adjust(top=top_pad)
+        return ax
+
     # ------------------ Various Bibliometric Plots ------------------
     def _load_world_gdf(self):
         if gpd is None:
@@ -2231,6 +2274,9 @@ class MainWindow(QMainWindow):
 
     # 1. Distribution of Publications per Year
     def _plot_docs_per_year(self):
+        self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         y = self._year_col()
         if not y: 
             self.canvas.ax.text(0.5,0.5,"Year column not found", ha='center'); return
@@ -2244,6 +2290,9 @@ class MainWindow(QMainWindow):
 
     # 2. Document Type Distribution (Pie Chart)
     def _plot_doc_type_pie(self):
+        self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         c = self._doc_type()
         if not c:
             self.canvas.ax.text(0.5,0.5,"Document Type column not found", ha='center'); return
@@ -2253,32 +2302,10 @@ class MainWindow(QMainWindow):
         self.canvas.ax.set_title("Document Type Distribution (Top 10)")
 
     # 3. Publications per Year by Document Type (clustered bars)
-    # def _plot_year_by_doctype(self):
-    #     y = self._year_col(); d = self._doc_type()
-    #     if not y or not d:
-    #         self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); return
-    #     dfp = self.df.copy()
-    #     dfp[y] = pd.to_numeric(dfp[y], errors='coerce').astype('Int64')
-    #     piv = (dfp.dropna(subset=[y, d])
-    #             .groupby([y, d])
-    #             .size()
-    #             .unstack(fill_value=0)
-    #             .sort_index())
-    #     self.canvas.ax.clear()
-    #     x = range(len(piv.index))
-    #     width = 0.75 / max(1, len(piv.columns))
-    #     for i, col in enumerate(piv.columns):
-    #         self.canvas.ax.bar([xx + i*width for xx in x], piv[col].values, width=width, label=str(col))
-    #     self.canvas.ax.set_xticks([xx + (len(piv.columns)-1)*width/2 for xx in x], labels=[str(i) for i in piv.index], rotation=45)
-    #     self.canvas.ax.set_ylabel("Documents")
-    #     self.canvas.ax.set_title("Publications per Year by Document Type")
-    #     self.canvas.ax.legend()
-    #     self.canvas.draw()
-
     def _plot_year_by_doctype(self):
         y = self._year_col(); d = self._doc_type()
         if not y or not d:
-            self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); return
+            self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); self.canvas.draw(); return
 
         dfp = self.df.copy()
         dfp[y] = pd.to_numeric(dfp[y], errors='coerce').astype('Int64')
@@ -2289,84 +2316,47 @@ class MainWindow(QMainWindow):
                 .unstack(fill_value=0)
                 .sort_index())
 
-        self.canvas.ax.clear()
-
+        ax = self._reset_canvas(top_pad=0.83)
         if piv.empty:
-            self.canvas.ax.text(0.5,0.5,"No data after grouping", ha='center'); 
-            self.canvas.draw(); 
-            return
+            ax.text(0.5,0.5,"No data after grouping", ha='center'); self.canvas.draw(); return
 
         import numpy as np
-        years = piv.index.to_numpy()
+        years   = piv.index.to_numpy()
         n_years = len(years)
         n_types = len(piv.columns)
 
-        # --- 1) Lebarkan canvas sesuai jumlah tahun ---
-        #    0.45 inch per tahun (min 7, max 20 inch biar ga kebangetan)
-        new_w = max(7.0, min(20.0, 0.45 * n_years))
-        self.canvas.figure.set_size_inches(new_w, 5.0, forward=True)
-
-        # --- 2) Param grup & bar width yang proporsional ---
+        # skala lebar bar proporsional jumlah tipe (tanpa mengubah ukuran figure)
         x = np.arange(n_years)
-        group_width = 0.85                           # lebar total satu grup tahun
-        bar_w = max(0.08, group_width / max(1, n_types))   # kasih minimum 0.08 biar gak terlalu tipis
+        group_width = 0.84
+        bar_w = max(0.08, min(0.28, group_width / max(1, n_types)))
 
-        # center-kan grup: mulai dari x - group_width/2 + offset
+        # offset sehingga setiap grup terpusat di x
+        left_edge = x - (group_width/2) + bar_w/2
         for i, col in enumerate(piv.columns):
-            offsets = x - group_width/2 + (i + 0.5) * bar_w
-            self.canvas.ax.bar(offsets, piv[col].to_numpy(), width=bar_w, label=str(col))
+            ax.bar(left_edge + i*bar_w, piv[col].to_numpy(), width=bar_w, label=str(col))
 
-        # --- 3) Formatting yang enak dibaca ---
-        self.canvas.ax.set_xticks(x, labels=[str(int(yy)) for yy in years], rotation=45, ha='right')
-        self.canvas.ax.set_ylabel("Documents")
-        self.canvas.ax.set_title("Publications per Year by Document Type")
-        self.canvas.ax.grid(axis='y', linestyle=':', alpha=0.4)
-        # kasih jarak judul dari plot
-        self.canvas.ax.set_title("Publications per Year by Document Type", pad=28)
-        # legend taruh di atas kalau seri banyak
-        if n_types > 6:
-            self.canvas.ax.legend(ncol=min(n_types, 4), loc='upper center', bbox_to_anchor=(0.5, 1.12))
-        else:
-            self.canvas.ax.legend(
-                ncol=n_types,
-                loc='upper center',
-                bbox_to_anchor=(0.5, 1.02),
-                frameon=False
-            )
+        # xtick—batasi supaya tidak terlalu rapat
+        max_xticks = 12
+        step = max(1, int(np.ceil(n_years / max_xticks)))
+        shown_idx = np.arange(0, n_years, step)
 
-        self.canvas.ax.grid(axis='y', linestyle=':', alpha=0.4)
+        ax.set_xticks(x[shown_idx], labels=[str(int(y)) for y in years[shown_idx]], rotation=45, ha='right')
+        ax.set_ylabel("Documents")
+        ax.set_title("Publications per Year by Document Type", pad=20)
+        ax.grid(axis='y', linestyle=':', alpha=0.4)
 
-        # beri ruang di atas untuk legend + judul
-        self.canvas.figure.subplots_adjust(top=0.82)
+        # legend di atas, tidak menutupi judul
+        ncol = min(n_types, 4) if n_types > 1 else 1
+        ax.legend(ncol=ncol, loc='upper center', bbox_to_anchor=(0.5, 1.02), frameon=False)
 
-        self.canvas.ax.margins(x=0.01)
-        self.canvas.figure.tight_layout()
+        self.canvas.figure.tight_layout(rect=[0,0,1,0.94])  # sisakan ruang atas utk legend
         self.canvas.draw()
 
     # 4. Publication Trends per Year by Document Type (lines)
-    # def _plot_trend_year_by_doctype(self):
-    #     y = self._year_col(); d = self._doc_type()
-    #     if not y or not d:
-    #         self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); return
-    #     dfp = self.df.copy()
-    #     dfp[y] = pd.to_numeric(dfp[y], errors='coerce').astype('Int64')
-    #     piv = (dfp.dropna(subset=[y, d])
-    #             .groupby([y, d])
-    #             .size()
-    #             .unstack(fill_value=0)
-    #             .sort_index())
-    #     self.canvas.ax.clear()
-    #     for col in piv.columns:
-    #         self.canvas.ax.plot(piv.index, piv[col].values, marker="o", label=str(col))
-    #     self.canvas.ax.set_xlabel("Year")
-    #     self.canvas.ax.set_ylabel("Documents")
-    #     self.canvas.ax.set_title("Publication Trends per Year by Document Type")
-    #     self.canvas.ax.legend()
-    #     self.canvas.draw()
     def _plot_trend_year_by_doctype(self):
         y = self._year_col(); d = self._doc_type()
         if not y or not d:
-            self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); return
+            self.canvas.ax.text(0.5,0.5,"Year or Document Type missing", ha='center'); self.canvas.draw(); return
 
         dfp = self.df.copy()
         dfp[y] = pd.to_numeric(dfp[y], errors='coerce').astype('Int64')
@@ -2377,56 +2367,37 @@ class MainWindow(QMainWindow):
                 .unstack(fill_value=0)
                 .sort_index())
 
-        self.canvas.ax.clear()
+        ax = self._reset_canvas(top_pad=0.83)
         if piv.empty:
-            self.canvas.ax.text(0.5,0.5,"No data after grouping", ha='center'); 
-            self.canvas.draw(); 
-            return
+            ax.text(0.5,0.5,"No data after grouping", ha='center'); self.canvas.draw(); return
 
         import numpy as np
-        years = piv.index.to_numpy()
+        years   = piv.index.to_numpy()
         n_years = len(years)
         n_types = len(piv.columns)
 
-        # --- Lebarkan kanvas proporsional jumlah tahun ---
-        new_w = max(7.0, min(20.0, 0.5 * n_years))  # 0.5 inch per tahun
-        self.canvas.figure.set_size_inches(new_w, 5.0, forward=True)
-
-        # Plot tiap tipe
+        # plot semua tipe
         for col in piv.columns:
-            self.canvas.ax.plot(years, piv[col].to_numpy(), marker="o", linewidth=1.8, label=str(col))
+            ax.plot(years, piv[col].to_numpy(), marker='o', linewidth=1.8, label=str(col))
 
-        # Formatting
-        self.canvas.ax.set_xlabel("Year")
-        self.canvas.ax.set_ylabel("Documents")
-        self.canvas.ax.set_title("Publication Trends per Year by Document Type", pad=28)
-        self.canvas.ax.grid(axis='y', linestyle=':', alpha=0.4)
+        # xtick: tampilkan secukupnya
+        max_xticks = 12
+        step = max(1, int(np.ceil(n_years / max_xticks)))
+        shown_years = years[::step]
+        ax.set_xticks(shown_years)
+        ax.set_xticklabels([str(int(y)) for y in shown_years], rotation=45, ha='right')
 
-        # xticks rapi
-        self.canvas.ax.set_xticks(years)
-        self.canvas.ax.set_xticklabels([str(int(y)) for y in years], rotation=45, ha='right')
+        ax.set_xlabel("Year")
+        ax.set_ylabel("Documents")
+        ax.set_title("Publication Trends per Year by Document Type", pad=20)
+        ax.grid(axis='y', linestyle=':', alpha=0.4)
 
-        # Legend di atas, tidak menutupi judul
-        self.canvas.ax.legend(
-            ncol=min(n_types, 4),
-            loc='upper center',
-            bbox_to_anchor=(0.5, 1.02),
-            frameon=False
-        )
+        ax.legend(ncol=min(n_types, 4), loc='upper center', bbox_to_anchor=(0.5, 1.02), frameon=False)
 
-        # Ruang untuk legend + judul
-        self.canvas.figure.subplots_adjust(top=0.80)
-        self.canvas.figure.tight_layout()
+        self.canvas.figure.tight_layout(rect=[0,0,1,0.94])
         self.canvas.draw()
 
     # 5. Top 10 Sources (Journals/Conferences)
-    # def _plot_top_sources(self):
-    #     s = self._source_col()
-    #     if not s:
-    #         self.canvas.ax.text(0.5,0.5,"Source title column not found", ha='center'); return
-    #     counts = self._series_clean(self.df[s]).value_counts().head(10).sort_values()
-    #     self.canvas.ax.barh(counts.index, counts.values)
-    #     self.canvas.ax.set_xlabel("Documents"); self.canvas.ax.set_title("Top 10 Sources")
     def _plot_top_sources(self):
         s = self._source_col()
         if not s:
@@ -2443,6 +2414,8 @@ class MainWindow(QMainWindow):
         counts = counts.head(10).sort_values()
 
         self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         bars = self.canvas.ax.barh(counts.index.tolist(), counts.values.tolist())
 
         # Label angka di ujung bar
@@ -2461,6 +2434,9 @@ class MainWindow(QMainWindow):
 
     # 6. WordCloud Author Keywords
     def _wordcloud_author_keywords(self):
+        self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         if WordCloud is None:
             self.canvas.ax.text(0.5,0.5,"Install 'wordcloud' to enable", ha='center'); return
         k = self._author_kw_col()
@@ -2472,6 +2448,9 @@ class MainWindow(QMainWindow):
 
     # 7. WordCloud Abstract
     def _wordcloud_abstract(self):
+        self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         if WordCloud is None:
             self.canvas.ax.text(0.5,0.5,"Install 'wordcloud' to enable", ha='center'); return
         a = self._abstract_col()
@@ -2483,6 +2462,9 @@ class MainWindow(QMainWindow):
 
     # 8. Author Collaboration Network (Top 30)
     def _author_collab_network(self):
+        self.canvas.ax.clear()
+        self.canvas.figure.clf()
+        self.canvas.ax = self.canvas.figure.add_subplot(111)
         if nx is None:
             self.canvas.ax.text(0.5,0.5,"Install 'networkx' to enable", ha='center'); return
         # bangun graf co-authorship
@@ -2554,6 +2536,8 @@ class MainWindow(QMainWindow):
         try:
             freq = self._build_keyword_freq()
             self.canvas.ax.clear()
+            self.canvas.figure.clf()
+            self.canvas.ax = self.canvas.figure.add_subplot(111)
             if freq is None or freq.empty:
                 self.canvas.ax.text(0.5, 0.5, "No keyword columns found or empty.", ha="center", va="center")
                 self.canvas.draw()
@@ -2627,6 +2611,8 @@ class MainWindow(QMainWindow):
         try:
             freq = self._build_keyword_freq()
             self.canvas.ax.clear()
+            self.canvas.figure.clf()
+            self.canvas.ax = self.canvas.figure.add_subplot(111)
             if freq is None or freq.empty:
                 self.canvas.ax.text(0.5, 0.5, "No keyword columns found or empty.", ha="center", va="center")
                 self.canvas.draw()
@@ -2701,63 +2687,55 @@ class MainWindow(QMainWindow):
             self.canvas.draw()
 
     # 10. Institution Type Distribution (Academic vs Non-Academic)
-    # def _plot_institution_type_dist(self):
-    #     c_aff = self._get_col("affiliations", "Affiliations", "Authors with affiliations", "Author Affiliations")
-    #     if not c_aff:
-    #         self.canvas.ax.text(0.5,0.5,"Affiliations column not found", ha='center'); return
-    #     def simple_type(s):
-    #         t = str(s).lower()
-    #         if any(k in t for k in ["univ","college","faculty","school of"]): return "Academic"
-    #         if any(k in t for k in ["research","academy","laboratory","institute"]): return "Research"
-    #         if any(k in t for k in ["corp","co.","inc","ltd","tech","company"]): return "Industry"
-    #         if any(k in t for k in ["gov","ministry","bureau","department"]): return "Government"
-    #         return "Unknown"
-    #     ser = self._series_clean(self.df[c_aff]).apply(simple_type).value_counts()
-    #     self.canvas.ax.bar(ser.index, ser.values)
-    #     self.canvas.ax.set_ylabel("Documents"); self.canvas.ax.set_title("Institution Type Distribution")
-    #     self.canvas.ax.tick_params(axis='x', rotation=15)
     def _plot_institution_type_dist(self):
         c_aff = self._get_col("affiliations", "Affiliations", "Authors with affiliations", "Author Affiliations")
         if not c_aff:
-            self.canvas.ax.text(0.5,0.5,"Affiliations column not found", ha='center'); return
+            self.canvas.ax.text(0.5, 0.5, "Affiliations column not found", ha='center'); 
+            self.canvas.draw(); 
+            return
 
         def simple_type(s: str) -> str:
             t = str(s).lower()
-            if any(k in t for k in ["univ","university","college","faculty","school of", "school", "üniversitesi", "instituto", "faculté", "institut", "uniwersytet"]): return "Academic"
-            if any(k in t for k in ["research","academy","laboratory","lab","institute", "recherche"]): return "Research"
-            if any(k in t for k in ["corp","co.","inc","ltd","tech","company","pt ","tbk", "industry", "bank", "unsw"]): return "Industry"
-            if any(k in t for k in ["gov","government","ministry","bureau","department","kementerian", "parliament", "commission", "interministérielle"]): return "Government"
-            print(f"Unknown institution type: {t}")
+            if any(k in t for k in ["univ","university","college","faculty","school of","school","üniversitesi","instituto","faculté","institut","uniwersytet", "nyu", "unsw", "ucla", "mit", "harvard", "stanford", "cambridge", "oxford", "eth", "epfl", "tudelft", "nus", "nanyang", "uio", "uio", "uottawa", "utoronto"]):
+                return "Academic"
+            if any(k in t for k in ["research","academy","laboratory","lab","institute","recherche","centre","center","observatory","observatorium","observatoire","researcher","researchers"]):
+                return "Research"
+            if any(k in t for k in ["corp","co.","inc","ltd","tech","company","pt ","tbk","industry","bank","consult","firm","gmbh","sa","ag","llc","pvt","private","enterprise","enterprises"]):
+                return "Industry"
+            if any(k in t for k in ["gov","government","ministry","bureau","department","kementerian","parliament","commission","interministérielle","agency","agencies","national","state","municipal","city","cities","council","councils","public","police","defense","defence","army","navy","air force","military","hospital","hôpital","health","clinic","clinique"]):
+                return "Government"
             return "Unknown"
 
         ser = self._series_clean(self.df[c_aff]).apply(simple_type).value_counts()
 
-        # --- layout yang rapi ---
-        self.canvas.ax.clear()
-        self.canvas.figure.clf()
-        self.canvas.ax = self.canvas.figure.add_subplot(111)
-        # ukuran kanvas yang wajar untuk 4–6 kategori
-        self.canvas.figure.set_size_inches(9, 5, forward=True)
+        # — Reset kanvas dengan layout stabil (tidak ubah ukuran figure) —
+        ax = self._reset_canvas(top_pad=0.88)
 
-        # urut naik supaya barh dari bawah ke atas enak dibaca
+        # urut naik agar barh enak dibaca
         ser = ser.sort_values(ascending=True)
 
-        bars = self.canvas.ax.barh(ser.index.tolist(), ser.values.tolist())
+        if ser.empty:
+            ax.text(0.5, 0.5, "No data", ha='center'); 
+            self.canvas.draw(); 
+            return
 
-        # label angka di ujung bar
-        xmax = ser.values.max() if len(ser) else 0
+        bars = ax.barh(ser.index.tolist(), ser.values.tolist())
+
+        # anotasi nilai di ujung bar
+        xmax = float(ser.values.max())
+        ax.set_xlim(0, xmax * 1.10)
         for bar, val in zip(bars, ser.values):
-            self.canvas.ax.text(bar.get_width() + max(1, xmax)*0.01,
-                                bar.get_y() + bar.get_height()/2,
-                                str(int(val)), va='center', ha='left', fontsize=9)
+            ax.text(bar.get_width() + xmax * 0.01,
+                    bar.get_y() + bar.get_height()/2,
+                    str(int(val)),
+                    va='center', ha='left', fontsize=9)
 
-        self.canvas.ax.set_xlabel("Documents")
-        self.canvas.ax.set_title("Institution Type Distribution", pad=16)
-        self.canvas.ax.grid(axis='x', linestyle=':', alpha=0.35)
+        ax.set_xlabel("Documents")
+        ax.set_title("Institution Type Distribution", pad=16)
+        ax.grid(axis='x', linestyle=':', alpha=0.35)
 
-        # beri ruang kiri untuk label, dan atas untuk judul
-        self.canvas.figure.subplots_adjust(left=0.28, right=0.95, top=0.88, bottom=0.12)
-        self.canvas.figure.tight_layout()
+        # ruang kiri lebih besar untuk label panjang; jangan pakai subplots_adjust + tight_layout barengan
+        self.canvas.figure.tight_layout(rect=[0.25, 0.06, 0.98, 0.94])
         self.canvas.draw()
 
     # 11. Documents by Country (Top 20)
@@ -2808,23 +2786,6 @@ class MainWindow(QMainWindow):
         self.canvas.draw()
 
     # 12. World Map Choropleth (matplotlib-only fallback)
-    # def _map_choropleth_docs_country(self):
-    #     if gpd is None or pycountry is None:
-    #         self.canvas.ax.text(0.5,0.5,"Install 'geopandas' & 'pycountry'", ha='center'); return
-    #     world = self._load_world_gdf()
-    #     if world is None:
-    #         self.canvas.ax.text(0.5,0.5,"World basemap not available", ha='center'); return
-    #     counts = self._count_by_country()
-    #     if not counts:
-    #         self.canvas.ax.text(0.5,0.5,"No country info", ha='center'); return
-    #     world["name_norm"] = world["NAME"].apply(self._norm_country) if "NAME" in world.columns else world["name"].apply(self._norm_country)
-    #     data = pd.Series(counts).rename("docs")
-    #     dfm = world.merge(data.to_frame(), left_on="name_norm", right_index=True, how="left").fillna({"docs":0})
-    #     self.canvas.ax.clear()
-    #     dfm.plot(column="docs", ax=self.canvas.ax, legend=True)
-    #     self.canvas.ax.set_title("World Map Choropleth — Documents per Country")
-    #     self.canvas.ax.axis("off")
-    #     self.canvas.draw()
 
     def _pick_world_shapefile(self) -> str | None:
         """Urutan: ./110m/ne_110m_admin_0_countries.shp -> ~/.slrdesk/cache/... -> dialog"""
