@@ -214,34 +214,54 @@ class MplCanvas(FigureCanvas):
 class JupyterConsole(RichJupyterWidget):
     def __init__(self, ns=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
         self.km = QtInProcessKernelManager()
         self.km.start_kernel(show_banner=False)
         self.km.kernel.gui = 'qt'
         self.kc = self.km.client()
         self.kc.start_channels()
-        # Initialize matplotlib inline without relying on widget.execute (compat across qtconsole versions)
+
+        # Penting: binding ke widget
+        self.kernel_manager = self.km
+        self.kernel_client  = self.kc
+
+        # Styling opsional
+        try: self.set_default_style('linux')
+        except Exception: pass
+
+        # Matplotlib inline via shell
         try:
-            self.kc.execute("%matplotlib inline")
+            self.km.kernel.shell.run_cell("%matplotlib inline")
         except Exception:
-            # Fallback to a safe import; inline may be set by backend anyway
-            self.kc.execute("import matplotlib.pyplot as plt")
+            pass
+
         if ns:
             self.push_variables(ns)
 
+        # Pakai helper yang aman (lihat definisi di bawah)
+        self.execute_code("print('Console ready. Use variable df if loaded.')")
+
     def push_variables(self, ns: dict):
-        self.km.kernel.shell.push(ns)
+        try:
+            self.km.kernel.shell.push(ns)
+        except Exception:
+            for k, v in ns.items():
+                self.km.kernel.shell.user_ns[k] = v
+
+    # >>> Helper baru; JANGAN override .execute bawaan widget <<<
+    def execute_code(self, code: str):
+        try:
+            # gunakan API widget bawaan; kompatibel dengan interactive/hidden
+            super().execute(code)   # memanggil RichJupyterWidget.execute
+        except Exception:
+            # fallback langsung ke shell
+            self.km.kernel.shell.run_cell(code)
 
     def shutdown(self):
-        try:
-            self.kc.stop_channels()
-            self.km.shutdown_kernel()
-        except Exception:
-            pass
-        try:
-            self.kc.stop_channels()
-            self.km.shutdown_kernel()
-        except Exception:
-            pass
+        try: self.kc.stop_channels()
+        except Exception: pass
+        try: self.km.shutdown_kernel(now=True)
+        except Exception: pass
 
 # ------------------------------- SQLite -------------------------------
 # NEW: Simple SQLite manager for articles and PDF paths
@@ -467,6 +487,10 @@ class MainWindow(QMainWindow):
         act_filter_dlg.setShortcut("Ctrl+F")
         act_filter_dlg.triggered.connect(self.open_filter_dialog)
         self.m_tools.addAction(act_filter_dlg)
+        act_restart_console = QAction("Restart Console", self)
+        act_restart_console.setShortcut("Ctrl+R")
+        act_restart_console.triggered.connect(self._restart_kernel)
+        self.m_tools.addAction(act_restart_console)
 
     def _init_ingest_tab(self):
         from PyQt6.QtWidgets import QSplitter
@@ -730,9 +754,9 @@ class MainWindow(QMainWindow):
         w = QWidget(); l = QVBoxLayout(w)
         self.console = JupyterConsole(ns={"pd": pd})
         l.addWidget(QLabel("Embedded Jupyter Console. Current df is in variable `df` when loaded."))
-        l.addWidget(self.console)
-        self.tab_w_console = w
+        l.addWidget(self.console, 1)
         self.tabs.addTab(w, "Console")
+        self.tab_w_console = w
 
     def _init_pdf_dock(self):
         self.pdf_dock = QDockWidget("PDF Viewer", self)
@@ -1211,6 +1235,41 @@ class MainWindow(QMainWindow):
     # wire:
     # self.chk_show_only.toggled.connect(self._toggle_show_only)
 
+    def _restart_kernel(self):
+        try:
+            # putuskan koneksi lama
+            if getattr(self.console, "kernel_client", None):
+                try: self.console.kernel_client.stop_channels()
+                except Exception: pass
+            if getattr(self.console, "kernel_manager", None):
+                try: self.console.kernel_manager.shutdown_kernel(now=True)
+                except Exception: pass
+        except Exception:
+            pass
+
+        # start kernel baru
+        km = QtInProcessKernelManager()
+        km.start_kernel(show_banner=False)
+        km.kernel.gui = 'qt'
+        kc = km.client(); kc.start_channels()
+
+        # re-bind ke widget
+        self.console.km = km
+        self.console.kc = kc
+        self.console.kernel_manager = km
+        self.console.kernel_client  = kc
+
+        # set matplotlib inline & reattach pd/df
+        try:
+            km.kernel.shell.run_cell("%matplotlib inline")
+        except Exception:
+            pass
+        km.kernel.shell.push({"pd": pd})
+        if self.df is not None:
+            km.kernel.shell.push({"df": self.df})
+
+        self.console.execute("print('Kernel restarted; df reattached' if 'df' in globals() else 'Kernel restarted')")
+
     def _build_keyword_color_map(self):
         """Dari self.filter_cfg → dict keyword→color. Default biru bila warna tak ditentukan."""
         cfg = getattr(self, "filter_cfg", {}) or {}
@@ -1417,6 +1476,13 @@ class MainWindow(QMainWindow):
                     "case": cur.get("case", False),
                     "cols": suggested_cols,
                 }
+            # Push into console
+            try:
+                if hasattr(self, "console") and self.console is not None:
+                    self.console.push_variables({"df": self.df})
+                    self.console.execute("print('df loaded into console:', len(df), 'rows')")
+            except Exception:
+                pass
         except Exception as e:
             self._show_error(e)
 
@@ -2217,6 +2283,12 @@ class MainWindow(QMainWindow):
                 self.plotly_dock.setVisible(show_plotly)
                 if show_plotly:
                     self.plotly_dock.raise_()
+            
+            if self.tabs.widget(idx) is self.tab_w_console:
+                try:
+                    self.console.setFocus()
+                except Exception:
+                    pass
         except Exception as e:
             self._show_error(e)
     
