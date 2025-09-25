@@ -39,6 +39,7 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 import matplotlib.pyplot as plt  # NEW
+import re, html
 
 import pandas as pd
 import sqlite3  # NEW
@@ -87,7 +88,7 @@ from PyQt6.QtWidgets import (  # TAMBAH QComboBox
     QApplication, QMainWindow, QWidget, QFileDialog, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QTabWidget, QSplitter, QLineEdit, QSpinBox, QCheckBox,
     QTableView, QGroupBox, QTextEdit, QProgressBar, QDockWidget, QMessageBox,
-    QToolBar, QComboBox
+    QToolBar, QComboBox, QMenu, QDialog, QFormLayout, QDialogButtonBox
 )
 
 # Optional PDF support
@@ -302,6 +303,54 @@ class DB:
         self.conn.commit()
         return cur.rowcount > 0
 
+class FilterDialog(QDialog):
+    def __init__(self, parent=None, columns: list[str] | None=None, current: dict | None=None):
+        super().__init__(parent)
+        self.setWindowTitle("Keyword Filter Settings")
+        self.setModal(True)
+        self.resize(560, 280)
+
+        lay = QVBoxLayout(self)
+
+        # Keywords + warna (format yang sudah kamu pakai)
+        self.ed_keywords = QLineEdit()
+        self.ed_keywords.setPlaceholderText("contoh: recovery:#d00000, blockchain:#008000, fault tolerance")
+
+        # Cutoff & case
+        self.sp_cutoff = QSpinBox(); self.sp_cutoff.setRange(1, 9999); self.sp_cutoff.setValue(1)
+        self.cb_case = QCheckBox("Case sensitive")
+
+        # Target columns (comma)
+        self.ed_cols = QLineEdit()
+        self.ed_cols.setPlaceholderText("Title, Abstract, Author Keywords, Index Keywords")
+
+        form = QFormLayout()
+        form.addRow("Keywords:", self.ed_keywords)
+        form.addRow("Cutoff:", self.sp_cutoff)
+        form.addRow("", self.cb_case)
+        form.addRow("Target columns:", self.ed_cols)
+        lay.addLayout(form)
+
+        btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        # isi default
+        if current:
+            self.ed_keywords.setText(current.get("raw", ""))
+            self.sp_cutoff.setValue(current.get("cutoff", 1))
+            self.cb_case.setChecked(bool(current.get("case", False)))
+            self.ed_cols.setText(", ".join(current.get("cols", [])))
+
+    def value(self):
+        return {
+            "raw": self.ed_keywords.text().strip(),
+            "cutoff": self.sp_cutoff.value(),
+            "case": self.cb_case.isChecked(),
+            "cols": [c.strip() for c in self.ed_cols.text().split(",") if c.strip()],
+        }
+
 
 # ------------------------------- Main Window -------------------------------
 
@@ -322,12 +371,17 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
 
-        self._init_toolbar()
+        self.filtered_table = None  # sebelum _init_ingest_tab()
+
+        # self._init_toolbar()
+        self._init_menubar()
         self._init_ingest_tab()
         self._init_filter_tab()
         self._init_biblio_tab()
         self._init_console_tab()
         self._init_pdf_dock()
+        # hide PDF dock by default; show only when user clicks "View PDF of Selected"
+        self.pdf_dock.setVisible(False)
         self._init_plotly_dock()
         self._init_error_dock()
 
@@ -371,17 +425,57 @@ class MainWindow(QMainWindow):
         act_view_pdf = QAction("View PDF of Selected", self)
         act_view_pdf.triggered.connect(self.view_pdf_of_selected)
         tb.addAction(act_view_pdf)
+    
+    def _init_menubar(self):
+        mb = self.menuBar()
 
+        # ---- File ----
+        m_file = mb.addMenu("&File")
+        act_open = QAction("Open CSV…", self)
+        act_open.setShortcut("Ctrl+O")
+        act_open.triggered.connect(self.open_csv)
+        m_file.addAction(act_open)
+
+        m_file.addSeparator()
+
+        act_exit = QAction("Exit", self)
+        act_exit.setShortcut("Ctrl+Q")
+        act_exit.triggered.connect(self.close)
+        m_file.addAction(act_exit)
+
+        # ---- Data ----
+        m_data = mb.addMenu("&Data")
+        act_cache = QAction("Cache DF", self)
+        act_cache.triggered.connect(self.cache_dataframe)
+        m_data.addAction(act_cache)
+
+        act_export = QAction("Export Filtered CSV", self)
+        act_export.triggered.connect(self.export_filtered)
+        m_data.addAction(act_export)
+
+        act_import_db = QAction("Import CSV → DB", self)
+        act_import_db.triggered.connect(self.import_csv_to_db)
+        m_data.addAction(act_import_db)
+
+        # ---- Tools (placeholder untuk nanti) ----
+        self.m_tools = mb.addMenu("&Tools")
+        act_filter_dlg = QAction("Filter Settings…", self)
+        act_filter_dlg.setShortcut("Ctrl+F")
+        act_filter_dlg.triggered.connect(self.open_filter_dialog)
+        self.m_tools.addAction(act_filter_dlg)
 
     def _init_ingest_tab(self):
+        from PyQt6.QtWidgets import QSplitter
         w = QWidget(); l = QVBoxLayout(w)
 
+        # info "Loaded" dengan tinggi tetap
         info = QLabel("No dataset loaded")
-        btn_open = QPushButton("Open Scopus CSV…")
-        btn_open.clicked.connect(self.open_csv)
+        info.setWordWrap(False)
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        info.setMaximumHeight(24)                     # <- tinggi fix
+        info.setStyleSheet("QLabel{padding:2px;}")
 
         # ===== Outer: Kiri–Kanan =====
-        from PyQt6.QtWidgets import QSplitter
         outer = QSplitter(Qt.Orientation.Horizontal)
 
         # ===== KIRI: Preview (atas) + Quick Stats (bawah) =====
@@ -392,6 +486,7 @@ class MainWindow(QMainWindow):
         self.table = QTableView()
         self.table.setAlternatingRowColors(True)
         self.table.setSortingEnabled(True)
+        self._install_table_context(self.table)
         lt.addWidget(QLabel("Preview:"))
         lt.addWidget(self.table)
 
@@ -404,7 +499,6 @@ class MainWindow(QMainWindow):
 
         left_split.addWidget(left_top)
         left_split.addWidget(left_bottom)
-        # proporsi awal: lebih banyak tinggi untuk tabel
         left_split.setSizes([800, 300])
 
         # ===== KANAN: Record Details =====
@@ -415,15 +509,12 @@ class MainWindow(QMainWindow):
         r.addWidget(QLabel("Record Details:"))
         r.addWidget(self.details_view)
 
-        # gabung ke outer split
         outer.addWidget(left_split)
         outer.addWidget(right)
-        # bagi lebar awal: kiri lebih besar
         outer.setSizes([1100, 500])
 
-        # ===== susun header + split =====
+        # susun
         l.addWidget(info)
-        l.addWidget(btn_open)
         l.addWidget(outer)
 
         self.ingest_info_label = info
@@ -498,44 +589,86 @@ class MainWindow(QMainWindow):
         return "<div style='font-family:Segoe UI,Arial,sans-serif;font-size:12px'>" + "".join(parts) + "</div>"
 
     def _init_filter_tab(self):
+        from PyQt6.QtWidgets import QSplitter
         w = QWidget(); outer = QVBoxLayout(w)
 
-        gb = QGroupBox("Keyword Filter & Paging")
-        gl = QHBoxLayout(gb)
-        self.keywords_edit = QLineEdit()
-        self.keywords_edit.setPlaceholderText("Format: kata1:#ff0000, kata2:#008000 (warna opsional)")
-        self.case_sensitive_chk = QCheckBox("Case sensitive")
-        self.cutoff_spin = QSpinBox(); self.cutoff_spin.setRange(1, 9999); self.cutoff_spin.setValue(1)
+        # Top controls: page + actions
+        top_bar = QHBoxLayout()
+        self.btn_filter_dlg = QPushButton("Filter Settings…")
+        self.btn_filter_dlg.clicked.connect(self.open_filter_dialog)
+
         self.page_size_spin = QSpinBox(); self.page_size_spin.setRange(10, 1000); self.page_size_spin.setValue(50)
         self.page_index_spin = QSpinBox(); self.page_index_spin.setRange(0, 999999); self.page_index_spin.setValue(0)
-        self.columns_combo = QComboBox(); self.columns_combo.setEditable(True)
-        self.columns_combo.setPlaceholderText("Target cols (comma), default: Title, Abstract, Keywords")
-        btn_apply = QPushButton("Apply Filter")
-        btn_apply.clicked.connect(self.apply_filter)
-        btn_prev = QPushButton("← Prev Page")
-        btn_prev.clicked.connect(self.prev_page)
-        btn_next = QPushButton("Next Page →")
-        btn_next.clicked.connect(self.next_page)
 
-        gl.addWidget(QLabel("Keywords:")); gl.addWidget(self.keywords_edit, 2)
-        gl.addWidget(QLabel("Cutoff:")); gl.addWidget(self.cutoff_spin)
-        gl.addWidget(QLabel("Page size:")); gl.addWidget(self.page_size_spin)
-        gl.addWidget(QLabel("Page index:")); gl.addWidget(self.page_index_spin)
-        gl.addWidget(self.case_sensitive_chk)
-        gl.addWidget(QLabel("Cols:")); gl.addWidget(self.columns_combo)
-        gl.addWidget(btn_apply); gl.addWidget(btn_prev); gl.addWidget(btn_next)
+        self.btn_first = QPushButton("⏮ First");  self.btn_first.clicked.connect(self.first_page)
+        btn_prev = QPushButton("← Prev Page"); btn_prev.clicked.connect(self.prev_page)
+        btn_next = QPushButton("Next Page →"); btn_next.clicked.connect(self.next_page)
+        self.btn_last = QPushButton("Last ⏭");     self.btn_last.clicked.connect(self.last_page)
 
-        self.filter_stats = QTextEdit(); self.filter_stats.setReadOnly(True)
+        self.lbl_pageinfo = QLabel("Page 1 / 1")
+
+        self.btn_save_filter = QPushButton("Save Filter…"); self.btn_save_filter.clicked.connect(self.save_filtered_records)
+        self.btn_sort_hits = QPushButton("Sort by hits (desc)"); self.btn_sort_hits.setCheckable(True); self.btn_sort_hits.setChecked(True)
+        self.btn_sort_hits.toggled.connect(lambda _: self._resort_filtered_by_hits())
+
+        self.chk_show_only = QCheckBox("Show only filtered"); self.chk_show_only.setChecked(True)
+
+        top_bar.addWidget(self.btn_filter_dlg)
+        top_bar.addSpacing(12)
+        top_bar.addWidget(QLabel("Page size:")); top_bar.addWidget(self.page_size_spin)
+        top_bar.addWidget(QLabel("Page index:")); top_bar.addWidget(self.page_index_spin)
+        top_bar.addWidget(self.btn_first); top_bar.addWidget(btn_prev)
+        top_bar.addWidget(btn_next); top_bar.addWidget(self.btn_last)
+        top_bar.addWidget(self.lbl_pageinfo)
+        top_bar.addStretch(1)
+        top_bar.addWidget(self.btn_sort_hits)
+        top_bar.addWidget(self.chk_show_only)
+        top_bar.addSpacing(12)
+        top_bar.addWidget(self.btn_save_filter)
+
+        # ==== Split kiri-kanan ====
+        split_lr = QSplitter(Qt.Orientation.Horizontal)
+
+        # KIRI: Preview (atas) + Filter Stats (bawah)
+        split_left = QSplitter(Qt.Orientation.Vertical)
+
+        # Preview table
+        left_top = QWidget(); lt = QVBoxLayout(left_top); lt.setContentsMargins(0,0,0,0)
         self.filtered_table = QTableView(); self.filtered_table.setAlternatingRowColors(True)
+        self.filtered_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self._install_table_context(self.filtered_table)
+        lt.addWidget(QLabel("Filtered Preview (paged):"))
+        lt.addWidget(self.filtered_table)
 
-        outer.addWidget(gb)
-        outer.addWidget(QLabel("Filter Stats:"))
-        outer.addWidget(self.filter_stats)
-        outer.addWidget(QLabel("Filtered Preview (paged):"))
-        outer.addWidget(self.filtered_table)
+        # Filter stats
+        left_bottom = QWidget(); lb = QVBoxLayout(left_bottom); lb.setContentsMargins(0,0,0,0)
+        self.filter_stats = QTextEdit(); self.filter_stats.setReadOnly(True)
+        self.filter_stats.setMinimumHeight(140)
+        lb.addWidget(QLabel("Filter Stats:"))
+        lb.addWidget(self.filter_stats)
 
-        self.tab_w_filter = w
-        self.tabs.addTab(w, "Filter & Highlight")
+        split_left.addWidget(left_top)
+        split_left.addWidget(left_bottom)
+        split_left.setSizes([800, 250])
+
+        # KANAN: Record Details (HTML with highlight)
+        right = QWidget(); r = QVBoxLayout(right); r.setContentsMargins(0,0,0,0)
+        self.details_view_filter = QTextEdit(); self.details_view_filter.setReadOnly(True)
+        self.details_view_filter.setAcceptRichText(True)
+        r.addWidget(QLabel("Record Details:"))
+        r.addWidget(self.details_view_filter)
+
+        split_lr.addWidget(split_left)
+        split_lr.addWidget(right)
+        split_lr.setSizes([1100, 520])
+
+        # Assemble
+        outer.addLayout(top_bar)
+        outer.addWidget(split_lr)
+
+        self.tab_w_filter = w 
+        self.tabs.addTab(w, "Filter_Highlight")
+        # self.open_filter_dialog()
 
     # def _init_biblio_tab(self):
     #     w = QWidget(); l = QVBoxLayout(w)
@@ -606,6 +739,12 @@ class MainWindow(QMainWindow):
             self.pdf_doc = QPdfDocument(self)
             self.pdf_view = QPdfView(self.pdf_dock)
             self.pdf_view.setDocument(self.pdf_doc)
+            # NEW: supaya multi-page dan bisa scroll
+            try:
+                self.pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
+                self.pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
+            except Exception:
+                pass
             self.pdf_dock.setWidget(self.pdf_view)
         else:
             stub = QLabel("Qt PDF module not available. Install PyQt6 with QtPdf to enable.")
@@ -806,6 +945,436 @@ class MainWindow(QMainWindow):
         data = data.sort_values(by="__total__", ascending=True).drop(columns="__total__")
         return data
 
+    def _install_table_context(self, view: QTableView):
+        if view is None:
+            return
+        try:
+            view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            view.customContextMenuRequested.connect(lambda p, v=view: self._on_table_context(v, p))
+        except Exception:
+            pass
+
+    def _on_table_context(self, view: QTableView, point):
+        idx = view.indexAt(point)
+        menu = QMenu(view)
+
+        act_attach = QAction("Attach PDF to Selected", self)
+        act_view   = QAction("View PDF of Selected", self)
+
+        act_attach.triggered.connect(self.attach_pdf_to_selected)
+        act_view.triggered.connect(self.view_pdf_of_selected)
+
+        if idx.isValid():
+            # pilih baris yang diklik agar handler pakai baris ini
+            view.selectRow(idx.row())
+            menu.addAction(act_attach)
+            menu.addAction(act_view)
+        else:
+            # kalau tidak klik di baris, disable
+            act_attach.setEnabled(False); act_view.setEnabled(False)
+            menu.addAction(act_attach); menu.addAction(act_view)
+
+        menu.exec(view.viewport().mapToGlobal(point))
+
+    def _parse_keyword_mapping(self, raw: str):
+        mapping, words = {}, []
+        if raw:
+            for token in raw.split(','):
+                token = token.strip()
+                if not token:
+                    continue
+                if ':' in token:
+                    k, c = token.split(':', 1)
+                    mapping[k.strip()] = c.strip()
+                    words.append(k.strip())
+                else:
+                    mapping[token] = '#c00000'
+                    words.append(token)
+        return mapping, words
+
+    def apply_filter_from_cfg(self, cfg: dict):
+        if self.df is None:
+            QMessageBox.warning(self, APP_NAME, "Load a CSV first.")
+            return
+
+        df = self.df.copy()
+        mapping, words = self._parse_keyword_mapping(cfg.get("raw",""))
+        case = bool(cfg.get("case", False))
+        cutoff = int(cfg.get("cutoff", 1))
+
+        # target cols
+        target_cols = [c for c in cfg.get("cols", []) if c in df.columns]
+        if not target_cols:
+            target_cols = self._guess_text_columns(df)
+
+        # hit counter
+        def count_hits_cell(cell: str) -> int:
+            if pd.isna(cell):
+                return 0
+            s = str(cell)
+            return sum(s.count(w) if case else s.lower().count(w.lower()) for w in words)
+
+        if words and target_cols:
+            hit_counts = df[target_cols].applymap(count_hits_cell).sum(axis=1)
+        else:
+            hit_counts = pd.Series([0]*len(df))
+
+        df["__hits__"] = hit_counts
+        kept = df[df["__hits__"] >= cutoff].copy()
+
+        # optional: sort by hits (kalau kamu punya tombol self.btn_sort_hits)
+        if hasattr(self, "btn_sort_hits") and self.btn_sort_hits.isChecked():
+            kept = kept.sort_values("__hits__", ascending=False)
+
+        # simpan & tampilkan
+        self.filtered_df = kept.drop(columns=["__hits__"], errors="ignore")
+        model = PandasModel(self.filtered_df)
+        model.set_target_columns(target_cols)
+        model.set_keywords_with_colors(mapping)
+        self.filtered_table.setModel(model)
+
+        # simpan kata kunci terakhir untuk fallback
+        self._last_filter_words = list(words) if 'words' in locals() else list(mapping.keys())
+
+        # connect selection -> detail panel + simpan base stats
+        if self.filtered_table.selectionModel():
+            self.filtered_table.selectionModel().selectionChanged.connect(self._on_filtered_row_selected)
+        self._filter_stats_base = self.filter_stats.toPlainText()
+        # pilih baris pertama agar detail langsung tampil
+        try:
+            if model.rowCount() > 0:
+                self.filtered_table.selectRow(0)
+        except Exception:
+            pass
+        self.model = model
+
+        # stats text sederhana
+        stats = [
+            f"Keywords: {list(mapping.keys())}",
+            f"Cutoff: {cutoff}",
+            f"Target cols: {target_cols}",
+            f"Total rows: {len(self.df):,}",
+            f"Rows kept: {len(self.filtered_df):,}",
+        ]
+        self.filter_stats.setPlainText("\n".join(stats))
+        self._filter_stats_base = self.filter_stats.toPlainText()  # <— simpan base
+
+        # paging
+        if hasattr(self, "page_size_spin") and hasattr(self, "page_index_spin"):
+            self.page_size = self.page_size_spin.value()
+            self.page_index = self.page_index_spin.value()
+        self.refresh_page()
+
+    def _resort_filtered_by_hits(self):
+        """Dipanggil saat tombol sort toggle berubah; resort filtered_df dan refresh."""
+        if self.filtered_df is None or '__hits__' not in self.filtered_df.columns:
+            return
+        desc = self.btn_sort_hits.isChecked()
+        self.filtered_df = self.filtered_df.sort_values('__hits__', ascending=not desc)
+        self.refresh_page()
+
+    import html, re
+
+    def _html_escape(self, s: str) -> str:
+        return html.escape("" if pd.isna(s) else str(s))
+
+    def _highlight_text(self, text: str, mapping: dict[str,str], case: bool) -> tuple[str, dict[str,int]]:
+        """Return (html, counts_per_keyword)."""
+        if not text:
+            return "", {}
+        counts = {k:0 for k in mapping.keys()}
+        esc = self._html_escape(text)
+        if not mapping:
+            return esc, counts
+
+        # siapkan regex alternatif dengan prioritas kata terpanjang dulu
+        keys = sorted(mapping.keys(), key=len, reverse=True)
+        pattern = "(" + "|".join(re.escape(k) for k in keys) + ")"
+        flags = 0 if case else re.IGNORECASE
+
+        def repl(m):
+            word = m.group(0)
+            # cari key canonical yg match (case-insens)
+            key = next((k for k in keys if (word == k if case else word.lower()==k.lower())), keys[0])
+            counts[key] += 1
+            color = mapping.get(key, "#c00000")
+            return f"<b><span style='color:{color}'>{html.escape(word)}</span></b>"
+
+        # Karena kita sudah escape HTML dulu (esc), perlu regex di text asli.
+        # Untuk sederhana: jalankan regex di text asli lalu rebuild manual dengan span.
+        # Alternatif: gunakan re.sub pada text asli lalu escape non-match — lebih singkat:
+        s = str("" if pd.isna(text) else text)
+        out = re.sub(pattern, repl, s, flags=flags)
+        return html.escape(out).replace("&lt;b&gt;","<b>").replace("&lt;/b&gt;","</b>").replace(
+            "&lt;span","<span").replace("span&gt;","span>"), counts
+
+    def _update_details_for_row(self, cur_index):
+        try:
+            if not cur_index.isValid():
+                self.details_view_filter.clear(); return
+            model = self.filtered_table.model()
+            if not isinstance(model, PandasModel):
+                return
+            dfrow = model.dataframe().iloc[cur_index.row()]
+            # ambil kolom umum
+            title_c = self._get_col(*TITLE_COL_CANDIDATES)
+            abs_c   = self._get_col(*ABSTRACT_COL_CANDIDATES)
+            ak_c    = self._author_kw_col()
+
+            title = dfrow.get(title_c, "")
+            abstr = dfrow.get(abs_c, "")
+            akeys = dfrow.get(ak_c, "")
+
+            # highlight
+            mapping = getattr(self, "keyword_mapping", {})
+            case = bool(getattr(self, "filter_cfg", {}).get("case", False))
+
+            title_html, c1 = self._highlight_text(str(title), mapping, case)
+            abs_html,   c2 = self._highlight_text(str(abstr), mapping, case)
+            kw_html,    c3 = self._highlight_text(str(akeys), mapping, case)
+
+            # frekuensi total per keyword
+            freq = {}
+            for d in (c1, c2, c3):
+                for k, v in d.items():
+                    freq[k] = freq.get(k, 0) + v
+
+            # build details html
+            lines = []
+            lines.append(f"<h3 style='margin:0 0 6px 0'>{title_html or '(no title)'} </h3>")
+            meta = []
+            ycol = self._year_col(); scol = self._source_col(); dcol = self._get_col('DOI','doi')
+            if ycol: meta.append(f"{self._html_escape(dfrow.get(ycol,''))}")
+            if scol: meta.append(self._html_escape(dfrow.get(scol,'')))
+            if dcol: meta.append(f"DOI: {self._html_escape(dfrow.get(dcol,''))}")
+            if meta: lines.append("<div style='color:#666'>" + " • ".join(meta) + "</div><hr>")
+
+            if ak_c:
+                lines.append(f"<b>Author Keywords:</b> {kw_html or '-'}<br>")
+            if abs_c:
+                lines.append(f"<b>Abstract:</b><br><div style='text-align:justify'>{abs_html or '-'}</div>")
+
+            # stats per keyword
+            if mapping:
+                lines.append("<hr><b>Matched terms & frequencies:</b><ul style='margin-top:4px'>")
+                for k in mapping.keys():
+                    if freq.get(k,0)>0:
+                        lines.append(f"<li>{html.escape(k)} : {freq.get(k,0)}</li>")
+                lines.append("</ul>")
+
+            self.details_view_filter.setHtml("\n".join(lines))
+
+            # tampilkan juga ringkasan freq di panel Filter Stats
+            if mapping:
+                stat_lines = ["Per-record term counts:"]
+                for k in mapping.keys():
+                    if freq.get(k,0)>0:
+                        stat_lines.append(f"- {k}: {freq[k]}")
+                self.filter_stats.append("\n" + "\n".join(stat_lines))
+
+        except Exception as e:
+            self._show_error(e)
+
+    def save_filtered_records(self):
+        if self.filtered_df is None or self.filtered_df.empty:
+            QMessageBox.information(self, APP_NAME, "No filtered data to save.")
+            return
+        # opsi format
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save filtered records", str(Path.home()/ "filtered"),
+            "CSV (*.csv);;Excel (*.xlsx);;Parquet (*.parquet)"
+        )
+        if not path:
+            return
+        try:
+            if path.lower().endswith(".xlsx"):
+                self.filtered_df.drop(columns=['__hits__'], errors='ignore').to_excel(path, index=False)
+            elif path.lower().endswith(".parquet"):
+                self.filtered_df.drop(columns=['__hits__'], errors='ignore').to_parquet(path, index=False)
+            else:
+                if not path.lower().endswith(".csv"): path += ".csv"
+                self.filtered_df.drop(columns=['__hits__'], errors='ignore').to_csv(path, index=False)
+            QMessageBox.information(self, APP_NAME, f"Saved: {path}")
+        except Exception as e:
+            self._show_error(e)
+    def _toggle_show_only(self, on):
+        if on or self.filtered_df is None:
+            return
+        # tampilkan full df (tanpa highlight)
+        model = PandasModel(self.df.copy())
+        self.filtered_table.setModel(model)
+        self.refresh_page()
+    # wire:
+    # self.chk_show_only.toggled.connect(self._toggle_show_only)
+
+    def _build_keyword_color_map(self):
+        """Dari self.filter_cfg → dict keyword→color. Default biru bila warna tak ditentukan."""
+        cfg = getattr(self, "filter_cfg", {}) or {}
+        raw = cfg.get("raw", "")
+        mapping, words = self._parse_keyword_mapping(raw)  # kamu sudah punya _parse_keyword_mapping
+        # default biru untuk setiap kata yang tidak diberi warna
+        color_map = {}
+        for w in words:
+            color_map[w.lower()] = mapping.get(w, "#1f77b4")  # biru default; boleh pakai nama warna umum juga
+        return color_map, [w.lower() for w in words]
+
+    def _highlight_keywords_html(self, text: str, kw_color_map: dict[str,str], bold=True) -> str:
+        if not isinstance(text, str) or not kw_color_map:
+            return "" if pd.isna(text) else str(text)
+        # regex \bword\b untuk tiap keyword (case-insensitive)
+        pattern = re.compile(r'\\b(' + "|".join(re.escape(k) for k in kw_color_map.keys()) + r')\\b', re.IGNORECASE)
+        def replacer(m):
+            word = m.group(0)
+            color = kw_color_map.get(word.lower(), "#1f77b4")
+            fw = 'bold' if bold else 'normal'
+            return f"<span style='color:{color}; font-weight:{fw}'>{word}</span>"
+        return pattern.sub(replacer, text)
+
+    def _count_occ_in_text(self, text: str, words_lower: list[str]) -> dict[str,int]:
+        counts = {w: 0 for w in words_lower}
+        if not isinstance(text, str):
+            text = "" if pd.isna(text) else str(text)
+        lower = text.lower()
+        for w in words_lower:
+            counts[w] += len(re.findall(r'\\b' + re.escape(w) + r'\\b', lower))
+        return counts
+
+    def _join_counts(self, *dicts):
+        out = {}
+        for d in dicts:
+            for k, v in d.items():
+                out[k] = out.get(k, 0) + int(v)
+        return out
+
+    def _on_filtered_row_selected(self, *_):
+        try:
+            sm = self.filtered_table.selectionModel() if hasattr(self, "filtered_table") else None
+            if not sm or not sm.hasSelection():
+                return
+            row = sm.selectedRows()[0].row()
+            m: PandasModel = self.filtered_table.model()
+            series = m.dataframe().iloc[row]
+
+            # siapkan highlight
+            color_map, words_lower = self._build_keyword_color_map()
+
+            # ambil nama kolom penting (supaya tahu mana yang di-highlight)
+            title_c  = self._get_col("Title","Document Title","Article Title")
+            abs_c    = self._abstract_col()
+            ak_c     = self._author_kw_col()
+
+            # rakit HTML semua kolom
+            rows_html = []
+            for col in series.index:
+                val = series[col]
+                col_name = html.escape(str(col))
+                if col == title_c or col == abs_c or col == ak_c:
+                    hv = self._highlight_keywords_html(val, color_map, bold=True)
+                else:
+                    hv = html.escape("" if pd.isna(val) else str(val))
+                rows_html.append(f"<tr><td style='padding:2px 8px;vertical-align:top;white-space:nowrap;'><b>{col_name}</b></td>"
+                                f"<td style='padding:2px 8px;'>{hv}</td></tr>")
+
+            html_doc = (
+                "<div style='font-family:Arial, sans-serif;'>"
+                "<h3 style='margin:0 0 8px 0;'>Record Details</h3>"
+                "<table border='0' cellspacing='0' cellpadding='0' style='border-collapse:collapse;'>"
+                + "".join(rows_html) +
+                "</table>"
+                "</div>"
+            )
+            self.details_view_filter.setHtml(html_doc)
+
+            # --- stats: frekuensi keyword pada row terpilih (Title + Abstract + Author Keywords)
+            title = series.get(title_c, "")
+            abstr = series.get(abs_c, "")
+            akeys = series.get(ak_c, "")
+            c1 = self._count_occ_in_text(title, words_lower)
+            c2 = self._count_occ_in_text(abstr, words_lower)
+            c3 = self._count_occ_in_text(akeys, words_lower)
+            occ = self._join_counts(c1, c2, c3)
+
+            lines = [(self._filter_stats_base or "").rstrip(), "", "Matches in selected row:"]
+            for w in sorted(occ.keys()):
+                lines.append(f" - {w}: {occ[w]}")
+            self.filter_stats.setPlainText("\n".join(lines).strip())
+
+        except Exception as e:
+            self._show_error(e)
+
+    # --- KEYWORD COLOR MAP & HIGHLIGHT (case-insensitive) ----------------------
+
+    def _build_keyword_color_map(self):
+        """
+        Ambil keyword->color dari filter settings (self.filter_cfg).
+        Jika warna tidak ditentukan, pakai biru '#1f77b4'.
+        Kembalikan: (color_map{lower_kw:str->color}, words_lower[list[str]])
+        """
+        # sumber kata: dari filter dialog (mapping) ATAU dari filter terakhir
+        raw = (getattr(self, "filter_cfg", {}) or {}).get("raw", "")  # contoh: "blockchain:red, traceability:gold"
+        mapping, words = self._parse_keyword_mapping(raw) if hasattr(self, "_parse_keyword_mapping") else ({}, [])
+        if not words and hasattr(self, "_last_filter_words"):
+            words = list(self._last_filter_words)  # fallback
+
+        # normalisasi lower
+        color_map = {}
+        for w in words:
+            lw = str(w).strip().lower()
+            if not lw:
+                continue
+            color = mapping.get(w, None)
+            if color is None:
+                color = "#1f77b4"  # default biru
+            color_map[lw] = color
+        return color_map, list(color_map.keys())
+
+    def _highlight_keywords_html(self, text: str, kw_color_map: dict[str,str], bold=True) -> str:
+        """Highlight kata kunci (case-insensitive). Menerima hex atau nama warna ('red', 'gold', dst.)."""
+        if text is None:
+            text = ""
+        s = "" if pd.isna(text) else str(text)
+        if not kw_color_map:
+            return html.escape(s)
+
+        # gunakan \bword\b, ignore case
+        patt = re.compile(r'\b(' + "|".join(re.escape(k) for k in kw_color_map.keys()) + r')\b', re.IGNORECASE)
+        def repl(m):
+            w = m.group(0)
+            color = kw_color_map.get(w.lower(), "#1f77b4")
+            fw = 'bold' if bold else 'normal'
+            return f"<span style='color:{color}; font-weight:{fw}'>{html.escape(w)}</span>"
+        # untuk bagian NON match, tetap di-escape
+        # caranya: split dan rakit kembali
+        out = []
+        last = 0
+        for mm in patt.finditer(s):
+            out.append(html.escape(s[last:mm.start()]))
+            out.append(repl(mm))
+            last = mm.end()
+        out.append(html.escape(s[last:]))
+        return "".join(out)
+
+    def _count_occ_in_text(self, text: str, words_lower: list[str]) -> dict[str,int]:
+        """Hitung kemunculan kata (case-insensitive) — cocok juga untuk 'Blockchain' atau 'blockchain-based'."""
+        if text is None:
+            text = ""
+        s = "" if pd.isna(text) else str(text)
+        lower = s.lower()
+        out = {w: 0 for w in words_lower}
+        for w in words_lower:
+            # \b cocok di sekitar huruf/angka vs non-word (hyphen dihitung boundary)
+            out[w] += len(re.findall(r'\b' + re.escape(w) + r'\b', lower))
+        return out
+
+    def _join_counts(self, *dicts):
+        out = {}
+        for d in dicts:
+            for k, v in d.items():
+                out[k] = out.get(k, 0) + int(v)
+        return out
+
+    # ------------------------------ End Helpers --------------------------------
+
     # ------------------------------ Actions --------------------------------
 
     def open_csv(self):
@@ -823,11 +1392,27 @@ class MainWindow(QMainWindow):
             self.set_dataframe(df)
             self.current_csv_path = path
             self.ingest_info_label.setText(f"Loaded: {path.name} ({len(df):,} rows × {len(df.columns):,} cols)")
+            self.ingest_info_label.setToolTip(str(path))     # path penuh di tooltip
             self.update_quick_stats()
             # Push into console
             self.console.push_variables({"df": self.df})
             # Saran kolom target (title/abstract/keywords terdeteksi otomatis)
-            self.columns_combo.setEditText(", ".join(self._guess_text_columns(self.df)))
+            # self.columns_combo.setEditText(", ".join(self._guess_text_columns(self.df)))
+            # Saran kolom target untuk filter:
+            suggested_cols = self._guess_text_columns(self.df)
+
+            # Jika UI lama (columns_combo) masih ada, isi; kalau tidak, simpan ke filter_cfg
+            if hasattr(self, "columns_combo") and self.columns_combo is not None:
+                self.columns_combo.setEditText(", ".join(suggested_cols))
+            else:
+                # siapkan default filter_cfg supaya dialog terisi otomatis
+                cur = getattr(self, "filter_cfg", {})
+                self.filter_cfg = {
+                    "raw": cur.get("raw", ""),
+                    "cutoff": cur.get("cutoff", 1),
+                    "case": cur.get("case", False),
+                    "cols": suggested_cols,
+                }
         except Exception as e:
             self._show_error(e)
 
@@ -840,6 +1425,9 @@ class MainWindow(QMainWindow):
         self._connect_table_selection(self.table)
         self._connect_table_selection(self.filtered_table)
         self.filtered_df = df.copy()  # NEW
+        self._install_table_context(self.table)
+        if self.filtered_table is not None:
+            self._install_table_context(self.filtered_table)
 
     def update_quick_stats(self):
         if self.df is None:
@@ -860,75 +1448,30 @@ class MainWindow(QMainWindow):
         if self.df is None:
             QMessageBox.warning(self, APP_NAME, "Load a CSV first.")
             return
-        try:
-            raw = self.keywords_edit.text().strip()
-            # Parse mapping: "word:#hex" atau hanya "word"
-            mapping = {}
-            words = []
-            if raw:
-                for token in raw.split(','):
-                    token = token.strip()
-                    if not token:
-                        continue
-                    if ':' in token:
-                        k, c = token.split(':', 1)
-                        mapping[k.strip()] = c.strip()
-                        words.append(k.strip())
-                    else:
-                        mapping[token] = '#c00000'
-                        words.append(token)
-            case = self.case_sensitive_chk.isChecked()
-            cutoff = self.cutoff_spin.value()
 
-            df = self.df.copy()
-            # Tentukan target columns
-            cols_txt = self.columns_combo.currentText().strip()
-            if cols_txt:
-                target_cols = [c.strip() for c in cols_txt.split(',') if c.strip() and c.strip() in df.columns]
-            else:
-                target_cols = self._guess_text_columns(df)
-            self.target_cols = target_cols
+        # kalau belum ada filter_cfg (mis. user belum buka dialog), ambil dari UI lama bila ada,
+        # atau pakai default sederhana
+        cfg = getattr(self, "filter_cfg", None)
+        if not cfg:
+            raw = ""
+            cutoff = 1
+            case = False
+            # fallback: kalau masih ada keywords_edit/cutoff_spin/case_sensitive_chk
+            if hasattr(self, "keywords_edit"):
+                raw = self.keywords_edit.text().strip()
+            if hasattr(self, "cutoff_spin"):
+                cutoff = self.cutoff_spin.value()
+            if hasattr(self, "case_sensitive_chk"):
+                case = self.case_sensitive_chk.isChecked()
+            cfg = {
+                "raw": raw,
+                "cutoff": cutoff,
+                "case": case,
+                "cols": self._guess_text_columns(self.df),
+            }
+            self.filter_cfg = cfg
 
-            def count_hits_cell(cell: str) -> int:
-                if pd.isna(cell):
-                    return 0
-                s = str(cell)
-                c = 0
-                for w in words:
-                    c += (s.count(w) if case else s.lower().count(w.lower()))
-                return c
-
-            if words and target_cols:
-                hit_counts = df[target_cols].applymap(count_hits_cell).sum(axis=1)
-            else:
-                hit_counts = pd.Series([0]*len(df))
-
-            df['__hits__'] = hit_counts
-            kept = df[df['__hits__'] >= cutoff].drop(columns=['__hits__']).copy()
-            self.filtered_df = kept
-
-            stats = [
-                f"Keywords: {list(mapping.keys())}",
-                f"Cutoff: {cutoff}",
-                f"Target cols: {target_cols}",
-                f"Total rows: {len(self.df):,}",
-                f"Rows kept: {len(kept):,}",
-            ]
-            self.filter_stats.setPlainText("\n".join(stats))
-
-            model = PandasModel(kept)
-            model.set_target_columns(target_cols)
-            model.set_keywords_with_colors(mapping)
-            self.filtered_table.setModel(model)
-            self.model = model
-            # re-wire selection ke details untuk tabel filtered
-            self._connect_table_selection(self.filtered_table)
-            self.details_view.setMinimumHeight(200)
-            self.page_size = self.page_size_spin.value()
-            self.page_index = self.page_index_spin.value()
-            self.refresh_page()
-        except Exception as e:
-            self._show_error(e)
+        self.apply_filter_from_cfg(cfg)
 
     def _get_col(self, *cands):
         """Ambil nama kolom pertama yang cocok (case-insensitive)."""
@@ -1205,6 +1748,31 @@ class MainWindow(QMainWindow):
             self.canvas.ax.clear()
             self.canvas.ax.text(0.5, 0.5, f"Error: {e}", ha="center", va="center")
             self.canvas.draw()
+
+    def _update_paging_ui(self):
+        total = len(self.filtered_df) if isinstance(self.filtered_df, pd.DataFrame) else 0
+        ps = max(1, int(getattr(self, "page_size", self.page_size_spin.value() if hasattr(self,"page_size_spin") else 50)))
+        tot_pages = max(1, (total + ps - 1) // ps)
+        cur = min(max(0, int(self.page_index_spin.value() if hasattr(self,"page_index_spin") else 0)), tot_pages-1)
+        self.page_index_spin.blockSignals(True)
+        self.page_index_spin.setMaximum(max(0, tot_pages-1))
+        self.page_index_spin.setValue(cur)
+        self.page_index_spin.blockSignals(False)
+        self.lbl_pageinfo.setText(f"Page {cur+1} / {tot_pages}")
+        self.btn_first.setEnabled(cur > 0)
+        self.btn_last.setEnabled(cur < tot_pages-1)
+
+    def first_page(self):
+        if hasattr(self, "page_index_spin"):
+            self.page_index_spin.setValue(0)
+            self.refresh_page()
+
+    def last_page(self):
+        if hasattr(self, "page_index_spin") and isinstance(self.filtered_df, pd.DataFrame):
+            ps = max(1, self.page_size_spin.value())
+            tot_pages = max(1, (len(self.filtered_df) + ps - 1)//ps)
+            self.page_index_spin.setValue(tot_pages-1)
+            self.refresh_page()
     
     # === NEW: klasifikasi tipe institusi (adaptasi dari kode Jupyter kamu) ===
     def _classify_institution_types(self, affil_str: str):
@@ -1330,6 +1898,10 @@ class MainWindow(QMainWindow):
             self.pdf_dock.setVisible(True)
             self.pdf_dock.raise_()
             self.pdf_doc.load(str(path))
+            try:
+                self.pdf_view.setPage(0)  # mulai dari halaman pertama
+            except Exception:
+                pass
         except Exception as e:
             self._show_error(e)
 
@@ -1371,6 +1943,20 @@ class MainWindow(QMainWindow):
             start = 0
         m._full_df = self.filtered_df if self.filtered_df is not None else m._full_df
         m.page(start, self.page_size)
+        self._update_paging_ui()
+        try:
+            if m.rowCount() > 0:
+                self.filtered_table.selectRow(0)
+        except Exception:
+            pass
+        self._update_paging_ui()
+        # auto-select row 0 setiap ganti halaman -> supaya detail kanan update
+        try:
+            m: PandasModel = self.filtered_table.model()
+            if m and m.rowCount() > 0:
+                self.filtered_table.selectRow(0)
+        except Exception:
+            pass
 
     def next_page(self):
         self.page_index_spin.setValue(self.page_index_spin.value() + 1)
@@ -1587,7 +2173,9 @@ class MainWindow(QMainWindow):
 
     def _on_tab_changed(self, idx: int):
         try:
-            idx_filter = self.tabs.indexOf(self.tab_w_filter)
+            # aman kalau tab belum dibuat
+            idx_filter = self.tabs.indexOf(self.tab_w_filter) if hasattr(self, "tab_w_filter") else -1
+            idx_ingest = self.tabs.indexOf(self.tab_w_ingest) if hasattr(self, "tab_w_ingest") else -1
             idx_biblio = self.tabs.indexOf(self.tab_w_biblio)
 
             show_pdf = (idx == idx_filter)
@@ -1604,6 +2192,17 @@ class MainWindow(QMainWindow):
                     self.plotly_dock.raise_()
         except Exception as e:
             self._show_error(e)
+    
+    def open_filter_dialog(self):
+        if self.df is None:
+            QMessageBox.information(self, APP_NAME, "Load a CSV first.")
+            return
+        cur = getattr(self, "filter_cfg", {"raw":"", "cutoff":1, "case":False, "cols": self._guess_text_columns(self.df)})
+        dlg = FilterDialog(self, list(self.df.columns), cur)
+        if dlg.exec():
+            self.filter_cfg = dlg.value()
+            # jalankan apply_filter dengan cfg ini
+            self.apply_filter_from_cfg(self.filter_cfg)
 
     # ------------------ Various Bibliometric Plots ------------------
     def _load_world_gdf(self):
